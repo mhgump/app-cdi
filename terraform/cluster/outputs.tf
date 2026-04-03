@@ -3,13 +3,8 @@ output "cluster_name" {
 }
 
 output "lb_ip" {
-  value       = google_compute_global_forwarding_rule.cluster_http.ip_address
-  description = "Load balancer IP (HTTP). Point DNS here."
-}
-
-output "lb_ip_https" {
-  value       = var.domain != "" ? google_compute_global_forwarding_rule.cluster_https[0].ip_address : ""
-  description = "Load balancer IP (HTTPS, empty if no domain configured)"
+  value       = var.domain != "" ? google_compute_global_address.cluster[0].address : google_compute_global_forwarding_rule.cluster_http.ip_address
+  description = "Load balancer IP. Point DNS here. When a domain is set, HTTP and HTTPS share this address."
 }
 
 output "instance_group" {

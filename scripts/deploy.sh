@@ -310,6 +310,10 @@ if [ -n "$DOMAIN" ]; then
         terraform -chdir="$TERRAFORM_CLUSTER_DIR" import \
             -var-file="$VARS_FILE" -input=false "$1" "$2" >/dev/null 2>&1 || true
     }
+    _import 'google_compute_global_address.cluster[0]' \
+        "projects/${PROJECT_ID}/global/addresses/${PREFIX}-ip"
+    _import 'google_compute_url_map.cluster_http_redirect[0]' \
+        "projects/${PROJECT_ID}/global/urlMaps/${PREFIX}-http-redirect"
     _import 'google_compute_managed_ssl_certificate.cluster[0]' \
         "projects/${PROJECT_ID}/global/sslCertificates/${PREFIX}-cert"
     _import 'google_compute_target_https_proxy.cluster[0]' \

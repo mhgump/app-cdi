@@ -179,10 +179,28 @@ resource "google_compute_url_map" "cluster" {
   default_service = google_compute_backend_service.cluster.id
 }
 
+# HTTP→HTTPS redirect URL map (only when a domain is configured)
+resource "google_compute_url_map" "cluster_http_redirect" {
+  count = var.domain != "" ? 1 : 0
+  name  = "${local.prefix}-http-redirect"
+
+  default_url_redirect {
+    https_redirect         = true
+    redirect_response_code = "MOVED_PERMANENTLY_DEFAULT"
+    strip_query            = false
+  }
+}
+
+# Shared static IP so HTTP (port 80) and HTTPS (port 443) resolve from the same address
+resource "google_compute_global_address" "cluster" {
+  count = var.domain != "" ? 1 : 0
+  name  = "${local.prefix}-ip"
+}
+
 # HTTP (always created)
 resource "google_compute_target_http_proxy" "cluster" {
   name    = "${local.prefix}-http-proxy"
-  url_map = google_compute_url_map.cluster.id
+  url_map = var.domain != "" ? google_compute_url_map.cluster_http_redirect[0].id : google_compute_url_map.cluster.id
 }
 
 resource "google_compute_global_forwarding_rule" "cluster_http" {
@@ -190,6 +208,7 @@ resource "google_compute_global_forwarding_rule" "cluster_http" {
   target                = google_compute_target_http_proxy.cluster.id
   port_range            = "80"
   load_balancing_scheme = "EXTERNAL_MANAGED"
+  ip_address            = var.domain != "" ? google_compute_global_address.cluster[0].id : null
 }
 
 # HTTPS (only when a domain is provided)
@@ -247,6 +266,7 @@ resource "google_compute_global_forwarding_rule" "cluster_https" {
   target                = google_compute_target_https_proxy.cluster[0].id
   port_range            = "443"
   load_balancing_scheme = "EXTERNAL_MANAGED"
+  ip_address            = google_compute_global_address.cluster[0].id
 }
 
 # ── Firewall: LB → instances ──────────────────────────────────────────────────
