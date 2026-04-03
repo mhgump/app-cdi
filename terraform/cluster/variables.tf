@@ -67,6 +67,12 @@ variable "git_deploy_key_secret" {
   default     = ""
 }
 
+variable "git_token_secret" {
+  description = "Secret Manager secret name holding a GitHub token for HTTPS clone auth. Takes precedence over git_deploy_key_secret when set."
+  type        = string
+  default     = ""
+}
+
 variable "container_port" {
   description = "Port the Docker container listens on (also the LB backend port)"
   type        = number

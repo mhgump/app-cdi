@@ -163,7 +163,7 @@ create_deploy_key() {
 
     case "$provider" in
         github)
-            response=$(curl -sf -X POST \
+            response=$(curl -s -X POST \
                 -H "Authorization: token ${token}" \
                 -H "Content-Type: application/json" \
                 -d "{\"title\":\"${title}\",\"key\":\"${public_key}\",\"read_only\":true}" \

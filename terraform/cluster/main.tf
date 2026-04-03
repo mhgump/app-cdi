@@ -71,6 +71,7 @@ resource "google_compute_instance_template" "cluster" {
     build-context            = var.build_context
     dockerfile               = var.dockerfile
     git-deploy-key-secret    = var.git_deploy_key_secret
+    git-token-secret         = var.git_token_secret
     container-port           = tostring(var.container_port)
     # Postgres / Redis passed as env to the container via supervisor
     postgres-host            = var.postgres_host
@@ -220,16 +221,13 @@ resource "google_certificate_manager_trust_config" "cluster" {
 
 resource "google_network_security_server_tls_policy" "cluster" {
   count    = var.mtls_ca_cert != "" ? 1 : 0
+  provider = google-beta
   name     = "${local.prefix}-tls-policy"
   location = "global"
 
   mtls_policy {
-    client_validation_mode = "REJECT_INVALID"
-    client_validation_ca {
-      certificate_manager_certificate_config {
-        ca_pool = google_certificate_manager_trust_config.cluster[0].id
-      }
-    }
+    client_validation_mode         = "REJECT_INVALID"
+    client_validation_trust_config = google_certificate_manager_trust_config.cluster[0].id
   }
 }
 

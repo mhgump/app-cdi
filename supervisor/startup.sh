@@ -6,6 +6,7 @@
 # All other $${...} are escaped Terraform template syntax for literal bash $${}
 
 set -euo pipefail
+export HOME=/root
 
 STARTUP_LOG="/var/log/startup.log"
 exec > >(tee -a "$STARTUP_LOG") 2>&1
@@ -17,6 +18,17 @@ meta_attr()    { curl -sf "$${META_URL}/instance/attributes/$1" -H "$${META_HEAD
 meta_project() { curl -sf "$${META_URL}/project/project-id" -H "$${META_HEADER}"; }
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [startup] $*"; }
+
+# Fetch a secret from Secret Manager using the instance SA token (no gcloud needed)
+fetch_secret() {
+    local secret="$1"
+    local token
+    token=$(curl -sf "$${META_URL}/instance/service-accounts/default/token" \
+        -H "$${META_HEADER}" | jq -r '.access_token')
+    curl -sf \
+        "https://secretmanager.googleapis.com/v1/projects/$${PROJECT_ID}/secrets/$${secret}/versions/latest:access" \
+        -H "Authorization: Bearer $${token}" | jq -r '.payload.data' | base64 -d
+}
 
 log "=== Instance startup ==="
 
@@ -51,16 +63,20 @@ fi
 systemctl enable docker
 systemctl start docker
 
-# ── Git deploy key (private repos only) ───────────────────────────────────────
+# ── Git auth (private repos only) ────────────────────────────────────────────
 
+GIT_TOKEN_SECRET=$(meta_attr "git-token-secret")
 DEPLOY_KEY_PATH=""
-if [ -n "$GIT_DEPLOY_KEY_SECRET" ]; then
+
+if [ -n "$GIT_TOKEN_SECRET" ]; then
+    log "Fetching GitHub token from Secret Manager ..."
+    GIT_TOKEN=$(fetch_secret "$GIT_TOKEN_SECRET")
+    GIT_REPO_URL=$(echo "$GIT_REPO_URL" | sed "s|https://|https://x-access-token:$${GIT_TOKEN}@|")
+    log "Git credentials embedded in repo URL."
+elif [ -n "$GIT_DEPLOY_KEY_SECRET" ]; then
     log "Fetching deploy key from Secret Manager ..."
     mkdir -p /root/.ssh
-    gcloud secrets versions access latest \
-        --secret="$GIT_DEPLOY_KEY_SECRET" \
-        --project="$PROJECT_ID" \
-        > /root/.ssh/deploy_key
+    fetch_secret "$GIT_DEPLOY_KEY_SECRET" > /root/.ssh/deploy_key
     chmod 600 /root/.ssh/deploy_key
 
     cat > /root/.ssh/config <<'SSHCONFIG'
@@ -72,7 +88,7 @@ SSHCONFIG
     chmod 600 /root/.ssh/config
     DEPLOY_KEY_PATH="/root/.ssh/deploy_key"
 else
-    log "No deploy key secret set — repo is public, cloning via HTTPS."
+    log "No auth secret set — repo is public, cloning via HTTPS."
 fi
 
 # ── Supervisor env ─────────────────────────────────────────────────────────────

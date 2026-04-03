@@ -174,8 +174,29 @@ find_local_ssh_key() {
 # ── Resolve deploy key ────────────────────────────────────────────────────────
 
 GIT_DEPLOY_KEY_SECRET=""
+GIT_TOKEN_SECRET=""
 
-if repo_is_public "$PARSED_HOST" "$PARSED_OWNER" "$PARSED_REPO"; then
+if [ -n "$GITHUB_TOKEN_OPT" ]; then
+    echo "Verifying GitHub token can access repo ..."
+    AUTH_URL="https://x-access-token:${GITHUB_TOKEN_OPT}@${PARSED_HOST}/${PARSED_OWNER}/${PARSED_REPO}.git"
+    if ! git -c credential.helper= ls-remote --exit-code "$AUTH_URL" HEAD &>/dev/null; then
+        echo "Error: token cannot access ${PARSED_HOST}/${PARSED_OWNER}/${PARSED_REPO}. Check that the token has read access to repository contents." >&2
+        exit 1
+    fi
+    echo "  Token verified."
+    echo "Repo is private — storing GitHub token in Secret Manager ..."
+    TOKEN_SECRET="${CLUSTER_NAME}-github-token"
+    if gcloud secrets describe "$TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null; then
+        echo "$GITHUB_TOKEN_OPT" | gcloud secrets versions add "$TOKEN_SECRET" \
+            --project="$PROJECT_ID" --data-file=-
+    else
+        echo "$GITHUB_TOKEN_OPT" | gcloud secrets create "$TOKEN_SECRET" \
+            --project="$PROJECT_ID" \
+            --data-file=- \
+            --labels="managed-by=cdi,cluster=${CLUSTER_NAME}"
+    fi
+    GIT_REPO_URL="https://x-access-token:${GITHUB_TOKEN_OPT}@${PARSED_HOST}/${PARSED_OWNER}/${PARSED_REPO}.git"
+elif repo_is_public "$PARSED_HOST" "$PARSED_OWNER" "$PARSED_REPO"; then
     echo "Repo is public — no deploy key needed, instances will clone via HTTPS."
     GIT_REPO_URL="$HTTPS_CLONE_URL"
 else
@@ -197,30 +218,13 @@ else
             --labels="managed-by=cdi,cluster=${CLUSTER_NAME}"
     fi
 
-    PROVIDER=$(git_provider_from_host "$PARSED_HOST")
-    TOKEN="$GITHUB_TOKEN_OPT"
-
-    if [ -n "$PROVIDER" ] && [ -n "$TOKEN" ]; then
-        echo "  Registering public key with ${PROVIDER} ..."
-        KEY_ID=$(create_deploy_key "$CLUSTER_NAME" "$PUBLIC_KEY" "$PROVIDER" "$PARSED_OWNER" "$PARSED_REPO" "$TOKEN")
-        echo "  Key ID: $KEY_ID"
-
-        KEY_ID_SECRET="${CLUSTER_NAME}-deploy-key-id"
-        echo "$KEY_ID" | gcloud secrets create "$KEY_ID_SECRET" \
-            --project="$PROJECT_ID" \
-            --data-file=- \
-            --labels="managed-by=cdi,cluster=${CLUSTER_NAME}" 2>/dev/null \
-        || echo "$KEY_ID" | gcloud secrets versions add "$KEY_ID_SECRET" \
-            --project="$PROJECT_ID" --data-file=-
-    else
-        echo ""
-        echo "  No token provided — add this public key to your repo manually"
-        echo "  as a read-only deploy key, then press Enter:"
-        echo ""
-        echo "$PUBLIC_KEY"
-        echo ""
-        read -rp "  Press Enter once the key is added ..."
-    fi
+    echo ""
+    echo "  No token provided — add this public key to your repo manually"
+    echo "  as a read-only deploy key, then press Enter:"
+    echo ""
+    echo "$PUBLIC_KEY"
+    echo ""
+    read -rp "  Press Enter once the key is added ..."
 
     GIT_DEPLOY_KEY_SECRET="$SECRET_NAME"
 fi
@@ -263,6 +267,7 @@ max_instances            = ${MAX_INSTANCES}
 target_cpu_utilization   = ${CPU_TARGET}
 git_repo_url             = "${GIT_REPO_URL}"
 git_deploy_key_secret    = "${GIT_DEPLOY_KEY_SECRET}"
+git_token_secret         = "${GIT_TOKEN_SECRET}"
 container_port           = ${CONTAINER_PORT}
 health_check_path        = "${HEALTH_PATH}"
 build_context            = "${BUILD_CONTEXT}"
