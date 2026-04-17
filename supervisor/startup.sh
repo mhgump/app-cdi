@@ -1,7 +1,9 @@
 #!/bin/bash
 # GCP Instance Startup Script  (Terraform template — do not run directly)
 #
-# Terraform injects: $${supervisor_b64}   ← base64-encoded supervisor.sh
+# Terraform injects:
+#   $${supervisor_b64}          ← base64-encoded supervisor.sh
+#   $${supervisor_http_gcs_uri} ← GCS URI of the compiled supervisor-http binary
 #
 # All other $${...} are escaped Terraform template syntax for literal bash $${}
 
@@ -38,7 +40,19 @@ GIT_DEPLOY_KEY_SECRET=$(meta_attr "git-deploy-key-secret")
 CONTAINER_PORT=$(meta_attr "container-port")
 PROJECT_ID=$(meta_project)
 
-log "Cluster: $CLUSTER_NAME | Port: $CONTAINER_PORT"
+# APP_PORT is the internal port the app container listens on.
+# supervisor-http listens on CONTAINER_PORT and reverse-proxies to APP_PORT.
+APP_PORT=$((CONTAINER_PORT + 1))
+
+# Resolve the instance name once at startup so both systemd services can use it.
+INSTANCE_ID=$(curl -sf "$${META_URL}/instance/name" -H "$${META_HEADER}" 2>/dev/null || hostname)
+
+# Redis config — read directly from instance metadata (same values supervisor.sh uses)
+REDIS_HOST=$(meta_attr "redis-host")
+REDIS_PORT=$(meta_attr "redis-port")
+REDIS_PREFIX=$(meta_attr "redis-prefix")
+
+log "Cluster: $CLUSTER_NAME | Port: $CONTAINER_PORT (app internal: $APP_PORT)"
 
 # ── Packages ──────────────────────────────────────────────────────────────────
 
@@ -92,6 +106,7 @@ else
 fi
 
 # ── Supervisor env ─────────────────────────────────────────────────────────────
+# This file is loaded by both supervisor.service and supervisor-http.service.
 
 mkdir -p /etc/supervisor
 cat > /etc/supervisor/env <<ENVFILE
@@ -100,8 +115,13 @@ GIT_REPO_URL="$GIT_REPO_URL"
 GIT_DEPLOY_KEY="$DEPLOY_KEY_PATH"
 APP_DIR="/opt/app"
 CONTAINER_PORT="$CONTAINER_PORT"
+APP_PORT="$APP_PORT"
 PROJECT_ID="$PROJECT_ID"
 CONTAINER_NAME="app"
+INSTANCE_ID="$INSTANCE_ID"
+REDIS_HOST="$REDIS_HOST"
+REDIS_PORT="$REDIS_PORT"
+REDIS_PREFIX="$REDIS_PREFIX"
 ENVFILE
 
 # ── Install supervisor binary ──────────────────────────────────────────────────
@@ -110,7 +130,14 @@ log "Installing supervisor ..."
 echo "${supervisor_b64}" | base64 -d > /usr/local/bin/supervisor
 chmod +x /usr/local/bin/supervisor
 
-# ── Systemd service ───────────────────────────────────────────────────────────
+# ── Install supervisor-http binary ────────────────────────────────────────────
+# The pre-compiled linux/amd64 binary is stored in GCS by deploy.sh.
+
+log "Downloading supervisor-http from ${supervisor_http_gcs_uri} ..."
+gcloud storage cp "${supervisor_http_gcs_uri}" /usr/local/bin/supervisor-http
+chmod +x /usr/local/bin/supervisor-http
+
+# ── Systemd services ───────────────────────────────────────────────────────────
 
 cat > /etc/systemd/system/supervisor.service <<'SERVICE'
 [Unit]
@@ -132,8 +159,30 @@ SyslogIdentifier=supervisor
 WantedBy=multi-user.target
 SERVICE
 
+cat > /etc/systemd/system/supervisor-http.service <<'SERVICE'
+[Unit]
+Description=Supervisor HTTP (health + metadata endpoints)
+After=docker.service network-online.target
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/supervisor/env
+ExecStart=/usr/local/bin/supervisor-http
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=supervisor-http
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
 systemctl daemon-reload
 systemctl enable supervisor
+systemctl enable supervisor-http
 systemctl start supervisor
+systemctl start supervisor-http
 
 log "=== Startup complete ==="

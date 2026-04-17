@@ -5,8 +5,13 @@ locals {
   # can decode it without needing a GCS dependency at boot time.
   supervisor_b64 = base64encode(file("${path.module}/../../supervisor/supervisor.sh"))
 
+  # supervisor-http is a compiled Go binary too large to embed in the startup script.
+  # deploy.sh builds it for linux/amd64 and uploads it to GCS; instances download it at boot.
+  supervisor_http_gcs_uri = "gs://${var.state_bucket}/supervisor-http"
+
   startup_script = templatefile("${path.module}/../../supervisor/startup.sh", {
-    supervisor_b64 = local.supervisor_b64
+    supervisor_b64          = local.supervisor_b64
+    supervisor_http_gcs_uri = local.supervisor_http_gcs_uri
   })
 }
 
@@ -33,6 +38,14 @@ resource "google_project_iam_member" "cluster_metric_writer" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.cluster.email}"
+}
+
+# Grant instances read access to the state bucket so they can download the
+# supervisor-http binary that deploy.sh uploads there.
+resource "google_storage_bucket_iam_member" "cluster_gcs_reader" {
+  bucket = var.state_bucket
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cluster.email}"
 }
 
 # Instances need to read their own metadata (rebuild-trigger) and update it
@@ -149,7 +162,7 @@ resource "google_compute_health_check" "cluster" {
 
   http_health_check {
     port         = var.container_port
-    request_path = var.health_check_path
+    request_path = "/health/local"
   }
 }
 

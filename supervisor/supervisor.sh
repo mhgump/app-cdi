@@ -7,11 +7,16 @@
 #
 # Environment provided by /etc/supervisor/env (set during startup):
 #   CLUSTER_NAME, GIT_REPO_URL, GIT_DEPLOY_KEY, APP_DIR,
-#   CONTAINER_PORT, PROJECT_ID, CONTAINER_NAME
+#   CONTAINER_PORT, APP_PORT, CONTAINER_NAME,
+#   INSTANCE_ID, REDIS_HOST, REDIS_PORT, REDIS_PREFIX, PROJECT_ID
 #
 # Container env is populated from instance metadata:
 #   postgres-host, postgres-user, postgres-schema, postgres-password-secret,
 #   redis-host, redis-port, redis-prefix
+#
+# supervisor-http runs alongside this script (separate systemd service) and serves
+# /health, /health/local, and /metadata on CONTAINER_PORT, proxying everything
+# else to the app container on APP_PORT.
 
 set -euo pipefail
 
@@ -28,6 +33,7 @@ meta() { curl -sf "${META_URL}/instance/attributes/$1" -H "$META_HEADER" 2>/dev/
 : "${GIT_REPO_URL:?GIT_REPO_URL not set}"
 : "${APP_DIR:?APP_DIR not set}"
 : "${CONTAINER_PORT:?CONTAINER_PORT not set}"
+: "${APP_PORT:?APP_PORT not set}"
 : "${PROJECT_ID:?PROJECT_ID not set}"
 : "${CONTAINER_NAME:?CONTAINER_NAME not set}"
 
@@ -38,9 +44,20 @@ fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# write_build_state writes the current build phase to /run/supervisor/build-state
+# so supervisor-http can include it in /health and /metadata responses.
+# Usage: write_build_state BUILDING [commit]
+#        write_build_state IDLE
+write_build_state() {
+    mkdir -p /run/supervisor
+    echo "$*" > /run/supervisor/build-state
+}
+
 fetch_env_file() {
     # Build /etc/supervisor/app.env with all secrets/config the container needs.
     # These are passed to `docker run --env-file`.
+    # Note: PORT is set to APP_PORT (the container's internal port). supervisor-http
+    # listens on CONTAINER_PORT and reverse-proxies to APP_PORT.
     local pg_password instance_id
     pg_password=$(gcloud secrets versions access latest \
         --secret="$(meta postgres-password-secret)" \
@@ -52,7 +69,7 @@ fetch_env_file() {
     cat > /etc/supervisor/app.env <<EOF
 CLUSTER_NAME=${CLUSTER_NAME}
 INSTANCE_ID=${instance_id}
-PORT=${CONTAINER_PORT}
+PORT=${APP_PORT}
 POSTGRES_HOST=$(meta postgres-host)
 POSTGRES_USER=$(meta postgres-user)
 POSTGRES_PASSWORD=${pg_password}
@@ -101,9 +118,17 @@ build_image() {
     [ -n "$ctx" ]        && build_context="${APP_DIR}/${ctx}"
     [ -n "$dockerfile" ] && dockerfile_args="-f ${APP_DIR}/${dockerfile}"
 
-    log "Building Docker image (context: ${build_context}) ..."
+    # Embed the git commit as a Docker label so supervisor-http can read it via
+    # `docker inspect` and include it in /health and /metadata responses.
+    local commit
+    commit=$(git -C "$APP_DIR" rev-parse HEAD)
+
+    log "Building Docker image (context: ${build_context}, commit: ${commit}) ..."
     # shellcheck disable=SC2086
-    docker build -t "${CONTAINER_NAME}:latest" ${dockerfile_args} "${build_context}"
+    docker build \
+        -t "${CONTAINER_NAME}:latest" \
+        --label "git-commit=${commit}" \
+        ${dockerfile_args} "${build_context}"
     log "Image built."
 }
 
@@ -116,11 +141,13 @@ stop_container() {
 }
 
 start_container() {
-    log "Starting container (port ${CONTAINER_PORT}) ..."
+    # Bind to 127.0.0.1 only — supervisor-http owns the external-facing CONTAINER_PORT
+    # and reverse-proxies inbound traffic to the app on APP_PORT.
+    log "Starting container (internal port ${APP_PORT}) ..."
     docker run -d \
         --name "$CONTAINER_NAME" \
         --restart=no \
-        -p "${CONTAINER_PORT}:${CONTAINER_PORT}" \
+        -p "127.0.0.1:${APP_PORT}:${APP_PORT}" \
         --env-file /etc/supervisor/app.env \
         --label "cluster=${CLUSTER_NAME}" \
         "${CONTAINER_NAME}:latest"
@@ -129,11 +156,13 @@ start_container() {
 
 redeploy() {
     local commit="${1:-}"
+    write_build_state "BUILDING ${commit}"
     fetch_env_file
     sync_repo "$commit"
     build_image
     stop_container
     start_container
+    write_build_state "IDLE"
 }
 
 healthcheck() {

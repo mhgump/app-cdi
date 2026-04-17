@@ -21,7 +21,6 @@
 #   --max           <n>      Max instances                (default: 10)
 #   --cpu-target    <0.0-1>  Autoscale CPU target         (default: 0.6)
 #   --port          <n>      Container port               (default: 8080)
-#   --health-path   <path>   Health check path            (default: /health)
 #   --build-context <path>   Subdirectory for Docker build context  (default: repo root)
 #   --dockerfile    <path>   Path to Dockerfile relative to repo root (default: Dockerfile in build context)
 #   --region        <name>   GCP region                   (default: us-central1)
@@ -50,7 +49,6 @@ MIN_INSTANCES=1
 MAX_INSTANCES=10
 CPU_TARGET=0.6
 CONTAINER_PORT=8080
-HEALTH_PATH="/health"
 BUILD_CONTEXT=""
 DOCKERFILE=""
 REGION="${REGION:-us-central1}"
@@ -69,7 +67,6 @@ while [[ $# -gt 0 ]]; do
         --max)           MAX_INSTANCES="$2";    shift 2 ;;
         --cpu-target)    CPU_TARGET="$2";       shift 2 ;;
         --port)          CONTAINER_PORT="$2";   shift 2 ;;
-        --health-path)   HEALTH_PATH="$2";      shift 2 ;;
         --build-context) BUILD_CONTEXT="$2";    shift 2 ;;
         --dockerfile)    DOCKERFILE="$2";       shift 2 ;;
         --region)        REGION="$2";           shift 2 ;;
@@ -243,6 +240,27 @@ POSTGRES_PASSWORD_SECRET=$(infra_output postgres_password_secret)
 REDIS_HOST=$(infra_output redis_host)
 REDIS_PORT=$(infra_output redis_port)
 
+# ── Build supervisor-http binary and upload to GCS ───────────────────────────
+#
+# supervisor-http is a Go binary (linux/amd64) that runs alongside supervisor.sh
+# on each instance. It serves /health, /health/local, and /metadata, and
+# reverse-proxies all other traffic to the app container.
+# Instances download it from GCS at boot (startup.sh).
+
+SUPERVISOR_DIR="$SCRIPT_DIR/../supervisor"
+SUPERVISOR_HTTP_BIN="$SUPERVISOR_DIR/supervisor-http"
+
+if ! command -v go &>/dev/null; then
+    echo "Error: Go is required to build supervisor-http. Install from https://go.dev/dl/" >&2
+    exit 1
+fi
+
+echo "Building supervisor-http (linux/amd64) ..."
+(cd "$SUPERVISOR_DIR" && go mod tidy && GOOS=linux GOARCH=amd64 go build -o "$SUPERVISOR_HTTP_BIN" .)
+
+echo "Uploading supervisor-http to gs://${TF_STATE_BUCKET}/supervisor-http ..."
+gsutil cp "$SUPERVISOR_HTTP_BIN" "gs://${TF_STATE_BUCKET}/supervisor-http"
+
 # ── Build var file ────────────────────────────────────────────────────────────
 
 VARS_FILE=$(mktemp /tmp/cluster-XXXXXX.tfvars)
@@ -269,7 +287,6 @@ git_repo_url             = "${GIT_REPO_URL}"
 git_deploy_key_secret    = "${GIT_DEPLOY_KEY_SECRET}"
 git_token_secret         = "${GIT_TOKEN_SECRET}"
 container_port           = ${CONTAINER_PORT}
-health_check_path        = "${HEALTH_PATH}"
 build_context            = "${BUILD_CONTEXT}"
 dockerfile               = "${DOCKERFILE}"
 data_namespace           = "${NAMESPACE}"
@@ -282,6 +299,7 @@ postgres_user            = "${POSTGRES_USER}"
 postgres_password_secret = "${POSTGRES_PASSWORD_SECRET}"
 redis_host               = "${REDIS_HOST}"
 redis_port               = ${REDIS_PORT}
+state_bucket             = "${TF_STATE_BUCKET}"
 EOF
 
 # mtls_ca_cert is a PEM block — append separately to avoid heredoc conflicts
@@ -339,15 +357,83 @@ cluster_tf "$CLUSTER_NAME" apply \
 
 LB_IP=$(cluster_output "$CLUSTER_NAME" lb_ip)
 
+# ── Fix forwarding rule IP drift ──────────────────────────────────────────────
+#
+# The GCP terraform provider silently ignores ip_address changes on forwarding
+# rules (it suppresses the diff). When transitioning from no-domain→domain the
+# forwarding rules can end up on a different IP than the static one, causing
+# FAILED_NOT_VISIBLE on the SSL cert. Detect and fix this here.
+
+if [ -n "$DOMAIN" ]; then
+    HTTP_FWD_IP=$(gcloud compute forwarding-rules describe "${PREFIX}-http" \
+        --global --project="$PROJECT_ID" --format="value(IPAddress)" 2>/dev/null || echo "")
+    if [ -n "$HTTP_FWD_IP" ] && [ "$HTTP_FWD_IP" != "$LB_IP" ]; then
+        echo "WARNING: Forwarding rule IP mismatch (actual ${HTTP_FWD_IP} ≠ static ${LB_IP})."
+        echo "Recreating forwarding rules, HTTPS proxy, and SSL cert on the correct IP ..."
+
+        terraform -chdir="$TERRAFORM_CLUSTER_DIR" state rm \
+            'google_compute_global_forwarding_rule.cluster_http' \
+            'google_compute_global_forwarding_rule.cluster_https[0]' \
+            'google_compute_target_https_proxy.cluster[0]' \
+            'google_compute_managed_ssl_certificate.cluster[0]' 2>/dev/null || true
+
+        gcloud compute forwarding-rules delete "${PREFIX}-http" "${PREFIX}-https" \
+            --global --project="$PROJECT_ID" --quiet 2>/dev/null || true
+        gcloud compute target-https-proxies delete "${PREFIX}-https-proxy" \
+            --global --project="$PROJECT_ID" --quiet 2>/dev/null || true
+        gcloud compute ssl-certificates list --global --project="$PROJECT_ID" \
+            --filter="name~${PREFIX}-cert" --format="value(name)" 2>/dev/null | \
+            xargs -I{} gcloud compute ssl-certificates delete {} \
+                --global --project="$PROJECT_ID" --quiet 2>/dev/null || true
+
+        cluster_tf "$CLUSTER_NAME" apply -var-file="$VARS_FILE" -input=false -auto-approve
+        LB_IP=$(cluster_output "$CLUSTER_NAME" lb_ip)
+    fi
+fi
+
 # ── Create DNS record ─────────────────────────────────────────────────────────
 
 echo "Creating DNS record: ${DOMAIN} → ${LB_IP} ..."
 create_dns_record "$DNS_ZONE" "$DOMAIN" "$LB_IP"
 
+# ── Monitor SSL certificate provisioning ─────────────────────────────────────
+#
+# Poll for up to 10 minutes. Exit loop early if the cert becomes ACTIVE or
+# enters a FAILED state (so the operator knows immediately, not hours later).
+
+if [ -n "$DOMAIN" ]; then
+    CERT_NAME=$(gcloud compute ssl-certificates list --global \
+        --project="$PROJECT_ID" --filter="name~${PREFIX}-cert" \
+        --format="value(name)" --limit=1 2>/dev/null || echo "")
+    if [ -n "$CERT_NAME" ]; then
+        echo "Monitoring SSL certificate (${CERT_NAME}) ..."
+        for i in $(seq 1 20); do
+            CERT_STATUS=$(gcloud compute ssl-certificates describe "$CERT_NAME" \
+                --global --project="$PROJECT_ID" \
+                --format="value(managed.status)" 2>/dev/null || echo "UNKNOWN")
+            DOMAIN_STATUS=$(gcloud compute ssl-certificates describe "$CERT_NAME" \
+                --global --project="$PROJECT_ID" \
+                --format="value(managed.domainStatus['${DOMAIN}'])" 2>/dev/null || echo "")
+            if [ "$CERT_STATUS" = "ACTIVE" ]; then
+                echo "  SSL certificate ACTIVE. HTTPS is ready."
+                break
+            elif [[ "$DOMAIN_STATUS" == *"FAILED"* ]]; then
+                echo ""
+                echo "  ERROR: Certificate provisioning failed: ${DOMAIN_STATUS}"
+                echo "  Check that port 80 responds: curl -sv http://${DOMAIN}"
+                echo "  To retry the cert: ./scripts/deploy.sh --key ${KEY} --repo ${PARSED_OWNER}/${PARSED_REPO}"
+                break
+            fi
+            echo "  Certificate ${CERT_STATUS} (${DOMAIN_STATUS:-pending}) — check ${i}/20 ..."
+            [ $i -lt 20 ] && sleep 30
+        done
+    fi
+fi
+
 echo ""
 echo "Deployment '${KEY}' complete."
 echo "  Load balancer IP: ${LB_IP}"
-echo "  URL: https://${DOMAIN}  (SSL cert takes ~15 min after DNS propagates)"
+echo "  URL: https://${DOMAIN}"
 echo ""
 echo "Monitor instances:"
 echo "  gcloud compute instance-groups managed list-instances cluster-${KEY} --region=${REGION} --project=${PROJECT_ID}"

@@ -79,10 +79,9 @@ variable "container_port" {
   default     = 8080
 }
 
-variable "health_check_path" {
-  description = "HTTP path for backend health checks"
+variable "state_bucket" {
+  description = "GCS bucket used for Terraform state and supervisor artifacts (supervisor-http binary)"
   type        = string
-  default     = "/health"
 }
 
 variable "data_namespace" {

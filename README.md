@@ -261,6 +261,19 @@ Include instance metadata in the response — it helps debugging:
 
 The load balancer has a **24-hour backend timeout** to support long-lived WebSocket connections.
 
+### WebSocket Connections
+
+CDI always serves traffic over HTTPS. Browsers block `ws://` connections on HTTPS pages as mixed content — the connection fails silently with no visible error.
+
+Always derive the WebSocket protocol from the page protocol:
+
+```javascript
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/your-path`);
+```
+
+Never hardcode `ws://` in a frontend that will be deployed through CDI.
+
 ### SIGTERM Handling
 
 The container receives `SIGTERM` before it is stopped. Flush connections, finish in-flight requests, then exit cleanly.

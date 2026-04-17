@@ -60,6 +60,11 @@ trap 'rm -f "$VARS_FILE"' EXIT
 echo "Loading cluster vars ..."
 load_cluster_vars "$CLUSTER_NAME" "$VARS_FILE"
 
+# Back-fill state_bucket if the saved var file predates this field
+if ! grep -q '^state_bucket' "$VARS_FILE"; then
+    echo "state_bucket = \"${TF_STATE_BUCKET}\"" >> "$VARS_FILE"
+fi
+
 # Extract values we need for cleanup
 REGION=$(grep '^region' "$VARS_FILE" | awk -F'"' '{print $2}')
 DOMAIN=$(grep '^domain' "$VARS_FILE" | awk -F'"' '{print $2}')
@@ -91,25 +96,14 @@ echo "Infrastructure destroyed."
 
 # ── Drop Postgres schema ──────────────────────────────────────────────────────
 
-SCHEMA="$KEY"
 echo ""
-echo "Dropping Postgres schema: $SCHEMA ..."
-
-PG_PASSWORD=$(gcloud secrets versions access latest \
-    --secret="$POSTGRES_PASSWORD_SECRET" \
-    --project="$PROJECT_ID" 2>/dev/null || true)
-
-if [ -n "$PG_PASSWORD" ] && [ -n "$POSTGRES_HOST" ]; then
-    PGPASSWORD="$PG_PASSWORD" psql \
-        -h "$POSTGRES_HOST" \
-        -U "$POSTGRES_USER" \
-        -d postgres \
-        -c "DROP SCHEMA IF EXISTS \"${SCHEMA}\" CASCADE;" \
-    && echo "Schema dropped." \
-    || echo "Warning: could not drop schema (may need to clean up manually)." >&2
-else
-    echo "Warning: could not retrieve Postgres credentials — skipping schema drop." >&2
-fi
+echo "Action required — drop Postgres schema '${KEY}' manually:"
+echo "  1. Retrieve the Postgres password:"
+echo "     gcloud secrets versions access latest --secret=${POSTGRES_PASSWORD_SECRET} --project=${PROJECT_ID}"
+echo "  2. Open Cloud SQL Studio in the GCP Console:"
+echo "     https://console.cloud.google.com/sql/instances/aviad--appcdi--postgres/studio?project=${PROJECT_ID}"
+echo "  3. Connect with user 'app', database 'postgres', and the password from step 1"
+echo "  4. Run: DROP SCHEMA IF EXISTS \"${KEY}\" CASCADE;"
 
 # ── Flush Redis keys ──────────────────────────────────────────────────────────
 
