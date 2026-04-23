@@ -97,11 +97,20 @@ sync_repo() {
     if [ -n "$commit" ] && [ "$commit" != "latest" ]; then
         log "Checking out ${commit} ..."
         git -C "$APP_DIR" checkout "$commit"
+        # If commit is a branch name (not a bare hash), fast-forward to origin
+        if git -C "$APP_DIR" show-ref --verify --quiet "refs/remotes/origin/${commit}"; then
+            git -C "$APP_DIR" reset --hard "origin/${commit}"
+        fi
     else
         local branch
         branch=$(git -C "$APP_DIR" remote show origin | awk '/HEAD branch/{print $NF}')
         git -C "$APP_DIR" checkout "$branch"
         git -C "$APP_DIR" pull origin "$branch"
+    fi
+
+    if git -C "$APP_DIR" lfs ls-files --name-only 2>/dev/null | grep -q .; then
+        log "Pulling LFS objects ..."
+        git -C "$APP_DIR" lfs pull
     fi
 
     log "Repo HEAD: $(git -C "$APP_DIR" rev-parse --short HEAD)"

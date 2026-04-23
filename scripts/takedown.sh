@@ -127,7 +127,7 @@ else
     echo "Warning: REDIS_HOST not available — skipping Redis cleanup." >&2
 fi
 
-# ── Revoke git deploy key ─────────────────────────────────────────────────────
+# ── Revoke git deploy key from provider ──────────────────────────────────────
 
 echo ""
 echo "Revoking deploy key ..."
@@ -140,7 +140,6 @@ KEY_ID=$(gcloud secrets versions access latest \
 if [ -n "$KEY_ID" ]; then
     TOKEN="$GITHUB_TOKEN_OPT"
     if [ -n "$TOKEN" ]; then
-        # Parse the git URL from saved tfvars to get provider/owner/repo
         SAVED_GIT_URL=$(grep '^git_repo_url' "$VARS_FILE" | awk -F'"' '{print $2}')
         parse_git_url "$SAVED_GIT_URL"
         PROVIDER=$(git_provider_from_host "$PARSED_HOST")
@@ -154,15 +153,24 @@ if [ -n "$KEY_ID" ]; then
         echo "Warning: no token provided — deploy key ID $KEY_ID NOT revoked from GitHub." >&2
         echo "  Re-run with --github-token to revoke, or remove it manually." >&2
     fi
-    gcloud secrets delete "$KEY_ID_SECRET" --project="$PROJECT_ID" --quiet 2>/dev/null || true
 else
     echo "No stored deploy key ID found (public repo or manually registered key)."
 fi
 
-# Delete the private key secret
-gcloud secrets delete "${CLUSTER_NAME}-deploy-key" \
-    --project="$PROJECT_ID" --quiet 2>/dev/null && echo "Private key secret deleted." \
-    || echo "Warning: could not delete private key secret." >&2
+# ── Delete all Secret Manager secrets for this cluster ───────────────────────
+#
+# delete_all_cluster_secrets finds secrets by label (managed-by=cdi, cluster=<name>).
+# The fallback list handles clusters deployed before the labeling framework was added.
+
+echo ""
+echo "Deleting cluster secrets ..."
+delete_all_cluster_secrets "$CLUSTER_NAME"
+
+# Backwards-compat: also try well-known names for pre-framework deployments
+for _secret in "${CLUSTER_NAME}-github-token" "${CLUSTER_NAME}-deploy-key" "${CLUSTER_NAME}-deploy-key-id"; do
+    gcloud secrets delete "$_secret" --project="$PROJECT_ID" --quiet 2>/dev/null \
+        && echo "Deleted secret: ${_secret} (legacy)" || true
+done
 
 # ── Remove saved var file from GCS ────────────────────────────────────────────
 

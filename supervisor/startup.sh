@@ -59,7 +59,7 @@ log "Cluster: $CLUSTER_NAME | Port: $CONTAINER_PORT (app internal: $APP_PORT)"
 log "Installing packages ..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -qq -y docker.io git curl jq
+apt-get install -qq -y docker.io git git-lfs curl jq
 
 # Google Cloud SDK is pre-installed on GCP Debian images; install if missing.
 if ! command -v gcloud &>/dev/null; then

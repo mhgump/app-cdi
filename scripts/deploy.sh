@@ -56,6 +56,7 @@ ZONES=""
 DISK_SIZE=50
 GITHUB_TOKEN_OPT=""
 MTLS_CA_CERT_PATH=""
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -74,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --disk-size)     DISK_SIZE="$2";        shift 2 ;;
         --github-token)  GITHUB_TOKEN_OPT="$2"; shift 2 ;;
         --mtls)          MTLS_CA_CERT_PATH="$2"; shift 2 ;;
+        --dry-run)       DRY_RUN=true;           shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -114,6 +116,8 @@ require_env DNS_ZONE
 CLUSTER_NAME="$KEY"
 DOMAIN="${KEY}.${DNS_DOMAIN}"
 NAMESPACE="${DATA_NAMESPACE:-$KEY}"
+REVIEW_DIR="${REPO_ROOT}/review/${CLUSTER_NAME}"
+DRY_RUN_SECRETS=()
 
 echo "Deploying: $KEY"
 echo "  Repo:      ${PARSED_HOST}/${PARSED_OWNER}/${PARSED_REPO}"
@@ -181,18 +185,15 @@ if [ -n "$GITHUB_TOKEN_OPT" ]; then
         exit 1
     fi
     echo "  Token verified."
-    echo "Repo is private — storing GitHub token in Secret Manager ..."
     TOKEN_SECRET="${CLUSTER_NAME}-github-token"
-    if gcloud secrets describe "$TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null; then
-        echo "$GITHUB_TOKEN_OPT" | gcloud secrets versions add "$TOKEN_SECRET" \
-            --project="$PROJECT_ID" --data-file=-
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY RUN] Would create secret: ${TOKEN_SECRET} (type: github-token)"
+        DRY_RUN_SECRETS+=("${TOKEN_SECRET}  type=github-token")
     else
-        echo "$GITHUB_TOKEN_OPT" | gcloud secrets create "$TOKEN_SECRET" \
-            --project="$PROJECT_ID" \
-            --data-file=- \
-            --labels="managed-by=cdi,cluster=${CLUSTER_NAME}"
+        echo "Repo is private — storing GitHub token in Secret Manager ..."
+        echo "$GITHUB_TOKEN_OPT" | create_cluster_secret "$CLUSTER_NAME" "$TOKEN_SECRET" "github-token"
     fi
-    GIT_REPO_URL="https://x-access-token:${GITHUB_TOKEN_OPT}@${PARSED_HOST}/${PARSED_OWNER}/${PARSED_REPO}.git"
+    GIT_TOKEN_SECRET="$TOKEN_SECRET"
 elif repo_is_public "$PARSED_HOST" "$PARSED_OWNER" "$PARSED_REPO"; then
     echo "Repo is public — no deploy key needed, instances will clone via HTTPS."
     GIT_REPO_URL="$HTTPS_CLONE_URL"
@@ -204,15 +205,12 @@ else
     echo "  Using local key: ${LOCAL_KEY}.pub"
 
     SECRET_NAME="${CLUSTER_NAME}-deploy-key"
-    echo "  Storing private key in Secret Manager ($SECRET_NAME) ..."
-    if gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null; then
-        cat "$LOCAL_KEY" | gcloud secrets versions add "$SECRET_NAME" \
-            --project="$PROJECT_ID" --data-file=-
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY RUN] Would create secret: ${SECRET_NAME} (type: deploy-key)"
+        DRY_RUN_SECRETS+=("${SECRET_NAME}  type=deploy-key")
     else
-        cat "$LOCAL_KEY" | gcloud secrets create "$SECRET_NAME" \
-            --project="$PROJECT_ID" \
-            --data-file=- \
-            --labels="managed-by=cdi,cluster=${CLUSTER_NAME}"
+        echo "  Storing private key in Secret Manager ($SECRET_NAME) ..."
+        cat "$LOCAL_KEY" | create_cluster_secret "$CLUSTER_NAME" "$SECRET_NAME" "deploy-key"
     fi
 
     echo ""
@@ -250,20 +248,24 @@ REDIS_PORT=$(infra_output redis_port)
 SUPERVISOR_DIR="$SCRIPT_DIR/../supervisor"
 SUPERVISOR_HTTP_BIN="$SUPERVISOR_DIR/supervisor-http"
 
-if ! command -v go &>/dev/null; then
-    echo "Error: Go is required to build supervisor-http. Install from https://go.dev/dl/" >&2
-    exit 1
+if [ "$DRY_RUN" = false ]; then
+    if ! command -v go &>/dev/null; then
+        echo "Error: Go is required to build supervisor-http. Install from https://go.dev/dl/" >&2
+        exit 1
+    fi
+
+    echo "Building supervisor-http (linux/amd64) ..."
+    (cd "$SUPERVISOR_DIR" && go mod tidy && GOOS=linux GOARCH=amd64 go build -o "$SUPERVISOR_HTTP_BIN" .)
+
+    echo "Uploading supervisor-http to gs://${TF_STATE_BUCKET}/supervisor-http ..."
+    gsutil cp "$SUPERVISOR_HTTP_BIN" "gs://${TF_STATE_BUCKET}/supervisor-http"
 fi
-
-echo "Building supervisor-http (linux/amd64) ..."
-(cd "$SUPERVISOR_DIR" && go mod tidy && GOOS=linux GOARCH=amd64 go build -o "$SUPERVISOR_HTTP_BIN" .)
-
-echo "Uploading supervisor-http to gs://${TF_STATE_BUCKET}/supervisor-http ..."
-gsutil cp "$SUPERVISOR_HTTP_BIN" "gs://${TF_STATE_BUCKET}/supervisor-http"
 
 # ── Build var file ────────────────────────────────────────────────────────────
 
-VARS_FILE=$(mktemp /tmp/cluster-XXXXXX.tfvars)
+VARS_FILE=$(mktemp /tmp/cluster-XXXXXX)
+mv "$VARS_FILE" "${VARS_FILE}.tfvars"
+VARS_FILE="${VARS_FILE}.tfvars"
 trap 'rm -f "$VARS_FILE"' EXIT
 
 # Convert comma-separated zones to HCL list
@@ -312,7 +314,59 @@ else
 fi
 
 # Save vars to GCS so takedown.sh can use them without re-prompting
-save_cluster_vars "$CLUSTER_NAME" "$VARS_FILE"
+if [ "$DRY_RUN" = false ]; then
+    save_cluster_vars "$CLUSTER_NAME" "$VARS_FILE"
+fi
+
+# ── Dry run: plan + export review artifacts, then exit ───────────────────────
+
+if [ "$DRY_RUN" = true ]; then
+    mkdir -p "$REVIEW_DIR"
+
+    echo "Planning cluster Terraform (dry run) ..."
+    cluster_tf_init "$CLUSTER_NAME"
+    terraform -chdir="$TERRAFORM_CLUSTER_DIR" plan \
+        -var-file="$VARS_FILE" \
+        -input=false \
+        -out="${REVIEW_DIR}/plan.tfplan"
+
+    terraform -chdir="$TERRAFORM_CLUSTER_DIR" show "${REVIEW_DIR}/plan.tfplan" \
+        | sed 's|https://x-access-token:[^@]*@|https://REDACTED@|g' \
+        > "${REVIEW_DIR}/plan.txt"
+
+    terraform -chdir="$TERRAFORM_CLUSTER_DIR" show -json "${REVIEW_DIR}/plan.tfplan" \
+        | sed 's|https:\\/\\/x-access-token:[^@]*@|https:\\/\\/REDACTED@|g' \
+        > "${REVIEW_DIR}/plan.json"
+
+    sed 's|https://x-access-token:[^@]*@|https://REDACTED@|g' \
+        "$VARS_FILE" > "${REVIEW_DIR}/vars.tfvars"
+
+    {
+        echo "# Secrets that would be created in Secret Manager"
+        echo "# All secrets are labeled: managed-by=cdi, cluster=${CLUSTER_NAME}, secret-type=<type>"
+        echo ""
+        if [ ${#DRY_RUN_SECRETS[@]} -eq 0 ]; then
+            echo "(none — public repo)"
+        else
+            for s in "${DRY_RUN_SECRETS[@]}"; do
+                echo "  $s"
+            done
+        fi
+    } > "${REVIEW_DIR}/secrets.txt"
+
+    echo ""
+    echo "Dry run complete. Review artifacts written to: ${REVIEW_DIR}"
+    echo "  plan.txt       — human-readable Terraform plan (tokens redacted)"
+    echo "  plan.json      — machine-readable plan with full resource diffs (tokens redacted)"
+    echo "  plan.tfplan    — binary plan (pass to terraform apply to execute exactly this plan)"
+    echo "  vars.tfvars    — effective variable values (tokens redacted)"
+    echo "  secrets.txt    — Secret Manager secrets that would be created"
+    echo ""
+    echo "Note: plan.tfplan reflects current remote state. If this is a new deployment"
+    echo "  transitioning to HTTPS, HTTPS resources will show as 'to be created' even"
+    echo "  if they already exist — run the real deploy to reconcile state first."
+    exit 0
+fi
 
 # ── Pre-import orphaned HTTPS resources (handles state drift on redeploy) ─────
 #
@@ -332,8 +386,9 @@ if [ -n "$DOMAIN" ]; then
         "projects/${PROJECT_ID}/global/addresses/${PREFIX}-ip"
     _import 'google_compute_url_map.cluster_http_redirect[0]' \
         "projects/${PROJECT_ID}/global/urlMaps/${PREFIX}-http-redirect"
+    DOMAIN_HASH=$(printf '%s' "${DOMAIN}" | md5sum | cut -c1-8)
     _import 'google_compute_managed_ssl_certificate.cluster[0]' \
-        "projects/${PROJECT_ID}/global/sslCertificates/${PREFIX}-cert"
+        "projects/${PROJECT_ID}/global/sslCertificates/${PREFIX}-cert-${DOMAIN_HASH}"
     _import 'google_compute_target_https_proxy.cluster[0]' \
         "projects/${PROJECT_ID}/global/targetHttpsProxies/${PREFIX}-https-proxy"
     _import 'google_compute_global_forwarding_rule.cluster_https[0]' \
@@ -356,6 +411,18 @@ cluster_tf "$CLUSTER_NAME" apply \
     -auto-approve
 
 LB_IP=$(cluster_output "$CLUSTER_NAME" lb_ip)
+
+# ── Roll instances to pick up the new template ────────────────────────────────
+# Terraform updates the instance template but GCP won't replace running instances
+# unless explicitly told to. This forces a rolling replace using the MIG's existing
+# surge/unavailable policy so we don't need to fight GCP's zone-count constraints.
+
+echo "Rolling instance replacement ..."
+gcloud compute instance-groups managed rolling-action replace \
+    "cluster-${CLUSTER_NAME}" \
+    --region="${REGION}" \
+    --project="${PROJECT_ID}" \
+    --quiet
 
 # ── Fix forwarding rule IP drift ──────────────────────────────────────────────
 #

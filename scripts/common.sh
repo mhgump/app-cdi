@@ -202,3 +202,53 @@ revoke_deploy_key() {
             ;;
     esac
 }
+
+# ── Secret Manager helpers ────────────────────────────────────────────────────
+#
+# All cluster secrets are labeled: managed-by=cdi, cluster=<name>, secret-type=<type>
+# This makes them discoverable and deletable as a group without hardcoded name lists.
+
+# Create or update a cluster secret with consistent labels.
+# Reads secret data from stdin (--data-file=-).
+# Usage: echo "$data" | create_cluster_secret <cluster_name> <secret_name> <secret_type>
+create_cluster_secret() {
+    local cluster_name="$1"
+    local secret_name="$2"
+    local secret_type="$3"
+
+    if gcloud secrets describe "$secret_name" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud secrets versions add "$secret_name" \
+            --project="$PROJECT_ID" --data-file=-
+    else
+        gcloud secrets create "$secret_name" \
+            --project="$PROJECT_ID" \
+            --data-file=- \
+            --labels="managed-by=cdi,cluster=${cluster_name},secret-type=${secret_type}"
+    fi
+}
+
+# Print all secret names belonging to a cluster (one per line).
+list_cluster_secrets() {
+    local cluster_name="$1"
+    gcloud secrets list \
+        --project="$PROJECT_ID" \
+        --filter="labels.managed-by=cdi AND labels.cluster=${cluster_name}" \
+        --format="value(name)"
+}
+
+# Delete all secrets belonging to a cluster (discovered via labels).
+delete_all_cluster_secrets() {
+    local cluster_name="$1"
+    local secrets secret
+    secrets=$(list_cluster_secrets "$cluster_name")
+    if [ -z "$secrets" ]; then
+        echo "No labeled secrets found for cluster '${cluster_name}'."
+        return
+    fi
+    while IFS= read -r secret; do
+        [ -z "$secret" ] && continue
+        gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null \
+            && echo "Deleted secret: ${secret}" \
+            || echo "Warning: could not delete secret: ${secret}" >&2
+    done <<< "$secrets"
+}

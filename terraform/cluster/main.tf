@@ -131,6 +131,7 @@ resource "google_compute_region_instance_group_manager" "cluster" {
   }
 
   distribution_policy_zones = length(var.zones) > 0 ? var.zones : null
+
 }
 
 # ── Autoscaler ────────────────────────────────────────────────────────────────
