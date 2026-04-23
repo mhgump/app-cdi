@@ -49,11 +49,12 @@ echo "  Commit/ref: $COMMIT"
 echo "  Trigger:    $TRIGGER_VALUE"
 echo ""
 
-# Find all instances in the cluster's MIG
-# Instances are labeled via the startup script metadata (cluster-name attribute).
+# Find all RUNNING instances in the cluster's MIG.
+# Filter to RUNNING only — during a rolling update, instances in STOPPING/TERMINATED
+# state still appear in the list but will reject metadata updates.
 INSTANCES=$(gcloud compute instances list \
     --project="$PROJECT_ID" \
-    --filter="metadata.items.key=cluster-name AND metadata.items.value=${CLUSTER_NAME}" \
+    --filter="metadata.items.key=cluster-name AND metadata.items.value=${CLUSTER_NAME} AND status=RUNNING" \
     --format="value(name,zone)" 2>/dev/null)
 
 if [ -z "$INSTANCES" ]; then
@@ -67,12 +68,15 @@ INSTANCE_COUNT=0
 while IFS=$'\t' read -r instance_name zone; do
     zone_short="${zone##*/}"
     echo "  Updating rebuild-trigger on $instance_name ($zone_short) ..."
-    gcloud compute instances add-metadata "$instance_name" \
+    if gcloud compute instances add-metadata "$instance_name" \
         --project="$PROJECT_ID" \
         --zone="$zone_short" \
         --metadata="rebuild-trigger=${TRIGGER_VALUE}" \
-        --quiet
-    INSTANCE_COUNT=$((INSTANCE_COUNT + 1))
+        --quiet 2>/dev/null; then
+        INSTANCE_COUNT=$((INSTANCE_COUNT + 1))
+    else
+        echo "  WARNING: $instance_name gone or not ready — skipping."
+    fi
 done <<< "$INSTANCES"
 
 echo ""

@@ -435,32 +435,28 @@ To deploy a specific commit, branch, or tag:
 
 ### View logs
 
-Find running instances:
+Select an instance first — this exports `$KEY`, `$INSTANCE_NAME`, and `$ZONE` for the commands below:
 
 ```bash
-gcloud compute instance-groups managed list-instances cluster-<key> \
-  --region=us-central1 \
-  --project=$PROJECT_ID
+source ./scripts/instance.sh --key ${KEY}
+# gcloud compute instance-groups managed list-instances cluster-${KEY} \
+#   --region=${REGION} --project=${PROJECT_ID}
 ```
 
-Tail the supervisor log on an instance (includes container lifecycle, build output, and app stdout/stderr):
+Tail the supervisor log (container lifecycle, build output, app stdout/stderr):
 
 ```bash
-gcloud compute ssh <instance-name> \
-  --zone=<zone> \
-  --project=$PROJECT_ID \
-  -- journalctl -fu supervisor
+./scripts/supervisor_logs.sh
+# gcloud compute ssh ${INSTANCE_NAME} --zone=${ZONE} --project=${PROJECT_ID} \
+#   --command="sudo journalctl -u supervisor -f"
 ```
 
-Your application's stdout/stderr appears inside the supervisor log as Docker container output.
+Tail the Docker container log directly:
 
-Expected log lines after a successful boot:
-
-```
-[supervisor] Repo HEAD: abc1234
-[supervisor] Image built.
-[supervisor] Container up: Up 2 minutes
-[server] :8080  instance=kvstore-xxxx  cluster=kvstore
+```bash
+./scripts/docker_logs.sh
+# gcloud compute ssh ${INSTANCE_NAME} --zone=${ZONE} --project=${PROJECT_ID} \
+#   --command="sudo docker logs app -f"
 ```
 
 ---

@@ -132,6 +132,14 @@ resource "google_compute_region_instance_group_manager" "cluster" {
 
   distribution_policy_zones = length(var.zones) > 0 ? var.zones : null
 
+  update_policy {
+    type                         = "PROACTIVE"
+    minimal_action               = "REPLACE"
+    replacement_method           = "SUBSTITUTE"
+    max_surge_fixed              = 3
+    max_unavailable_fixed        = 0
+  }
+
 }
 
 # ── Autoscaler ────────────────────────────────────────────────────────────────
