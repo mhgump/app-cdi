@@ -435,29 +435,15 @@ To deploy a specific commit, branch, or tag:
 
 ### View logs
 
-Select an instance first — this exports `$KEY`, `$INSTANCE_NAME`, and `$ZONE` for the commands below:
+`source .envrc` defines three shell helpers. Pick an instance, then tail the log you want:
 
 ```bash
-source ./scripts/instance.sh --key ${KEY}
-# gcloud compute instance-groups managed list-instances cluster-${KEY} \
-#   --region=${REGION} --project=${PROJECT_ID}
+inst-source <key>   # exports KEY, INSTANCE_NAME, ZONE (picks a RUNNING instance)
+instance-logs       # tail supervisor log (container lifecycle, build output, app stdout/stderr)
+docker-logs         # tail the Docker container log directly
 ```
 
-Tail the supervisor log (container lifecycle, build output, app stdout/stderr):
-
-```bash
-./scripts/supervisor_logs.sh
-# gcloud compute ssh ${INSTANCE_NAME} --zone=${ZONE} --project=${PROJECT_ID} \
-#   --command="sudo journalctl -u supervisor -f"
-```
-
-Tail the Docker container log directly:
-
-```bash
-./scripts/docker_logs.sh
-# gcloud compute ssh ${INSTANCE_NAME} --zone=${ZONE} --project=${PROJECT_ID} \
-#   --command="sudo docker logs app -f"
-```
+Under the hood these are just `gcloud compute ssh ... --command="sudo journalctl -u supervisor -f"` / `... "sudo docker logs app -f"`.
 
 ---
 
